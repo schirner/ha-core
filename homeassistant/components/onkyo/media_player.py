@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 import eiscp
@@ -25,6 +26,9 @@ from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 _LOGGER = logging.getLogger(__name__)
 
 CONF_SOURCES = "sources"
+# separate config entry for network sources (apps)
+# to allow for selecting network apps as sources via GUI
+CONF_NET_SOURCES = "net_sources"
 CONF_MAX_VOLUME = "max_volume"
 CONF_RECEIVER_MAX_VOLUME = "receiver_max_volume"
 
@@ -48,6 +52,8 @@ SUPPORT_ONKYO = (
 )
 
 KNOWN_HOSTS: list[str] = []
+# default list of sources
+# <internalName> : <HA Name>
 DEFAULT_SOURCES = {
     "tv": "TV",
     "bd": "Bluray",
@@ -61,7 +67,46 @@ DEFAULT_SOURCES = {
     "video6": "Video 6",
     "video7": "Video 7",
     "fm": "Radio",
+    "net": "Network",
 }
+
+
+# Default Net sources, key is the hex number of the source, value the text
+# appearing in HA User INterface
+# https://github.com/miracle2k/onkyo-eiscp/blob/master/eiscp-commands.yaml
+# command NLT
+DEFAULT_NET_SOURCES = {
+    "00": "DLNA",
+    # "01" : "Favorite",
+    # "02" : "vTuner",
+    # "03" : "SiriusXM",
+    "04": "Pandora",
+    # "05" : "Rhapsody",
+    # "06" : "Last.fm",
+    # "07" : "Napster",
+    # "08" : "Slacker",
+    # "09" : "Mediafly",
+    "0A": "Spotify",
+    # "0B" : "AUPEO!",
+    # "0C" : "radiko",
+    # "0D" : "e-onkyo",
+    "0E": "TuneIn Radio",
+    # 0F" : "MP3tunes",
+    # "10" : "Simfy",
+    # "11" : "Home Media",
+    "12": "Deezer",
+    # "13" : "iHeartRadio",
+    # manually
+    "40": "Chromecast",
+    # additional from excel
+    # https://michael.elsdoerfer.name/onkyo/ISCP_AVR_2014.Models.xlsx
+    "F0": "USB Front",
+    "F1": "USB Rear",
+    # "F2" : "Internet Radio",
+    "F3": "NET-Menu",
+    "FF": "None",
+}
+
 
 DEFAULT_PLAYABLE_SOURCES = ("fm", "am", "tuner")
 
@@ -76,6 +121,9 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
             CONF_RECEIVER_MAX_VOLUME, default=DEFAULT_RECEIVER_MAX_VOLUME
         ): cv.positive_int,
         vol.Optional(CONF_SOURCES, default=DEFAULT_SOURCES): {cv.string: cv.string},
+        vol.Optional(CONF_NET_SOURCES, default=DEFAULT_NET_SOURCES): {
+            cv.string: cv.string
+        },
     }
 )
 
@@ -107,6 +155,16 @@ ONKYO_SELECT_OUTPUT_SCHEMA = vol.Schema(
 )
 
 SERVICE_SELECT_HDMI_OUTPUT = "onkyo_select_hdmi_output"
+
+# only allow 1 parallel call for this integration as the
+# underlying library is not thread safe
+# otherwise we get concurrent calls.
+# NOTE although restricted, it seems we are still getting parallel calls
+#  between an update and set function (e.g. select_input, volume_down,
+# and especially the longer running service calls for playing media)
+# Debugging has shown that the parallel_updates semaphore is locked
+# when the call arrives in the integration (but I don't see the )
+PARALLEL_UPDATES = 1
 
 
 def _parse_onkyo_payload(payload):
@@ -193,6 +251,7 @@ def setup_platform(
                 OnkyoDevice(
                     receiver,
                     config.get(CONF_SOURCES),
+                    config.get(CONF_NET_SOURCES),
                     name=config.get(CONF_NAME),
                     max_volume=config.get(CONF_MAX_VOLUME),
                     receiver_max_volume=config.get(CONF_RECEIVER_MAX_VOLUME),
@@ -210,6 +269,7 @@ def setup_platform(
                         "2",
                         receiver,
                         config.get(CONF_SOURCES),
+                        config.get(CONF_NET_SOURCES),
                         name=f"{config[CONF_NAME]} Zone 2",
                         max_volume=config.get(CONF_MAX_VOLUME),
                         receiver_max_volume=config.get(CONF_RECEIVER_MAX_VOLUME),
@@ -223,6 +283,7 @@ def setup_platform(
                         "3",
                         receiver,
                         config.get(CONF_SOURCES),
+                        config.get(CONF_NET_SOURCES),
                         name=f"{config[CONF_NAME]} Zone 3",
                         max_volume=config.get(CONF_MAX_VOLUME),
                         receiver_max_volume=config.get(CONF_RECEIVER_MAX_VOLUME),
@@ -233,7 +294,11 @@ def setup_platform(
     else:
         for receiver in eISCP.discover():
             if receiver.host not in KNOWN_HOSTS:
-                hosts.append(OnkyoDevice(receiver, config.get(CONF_SOURCES)))
+                hosts.append(
+                    OnkyoDevice(
+                        receiver, config.get(CONF_SOURCES), config.get(CONF_NET_SOURCES)
+                    )
+                )
                 KNOWN_HOSTS.append(receiver.host)
     add_entities(hosts, True)
 
@@ -247,10 +312,11 @@ class OnkyoDevice(MediaPlayerEntity):
         self,
         receiver,
         sources,
+        net_sources,
         name=None,
         max_volume=SUPPORTED_MAX_VOLUME,
         receiver_max_volume=DEFAULT_RECEIVER_MAX_VOLUME,
-    ):
+    ) -> None:
         """Initialize the Onkyo Receiver."""
         self._receiver = receiver
         self._attr_is_volume_muted = False
@@ -268,27 +334,97 @@ class OnkyoDevice(MediaPlayerEntity):
 
         self._max_volume = max_volume
         self._receiver_max_volume = receiver_max_volume
-        self._attr_source_list = list(sources.values())
+        #  show combined sources and net sources in pull down list
+        self._attr_source_list = list(sources.values()) + list(net_sources.values())
         self._source_mapping = sources
-        self._reverse_mapping = {value: key for key, value in sources.items()}
+        self._source_net_mapping = net_sources
+        # combine the dynamic (user defined source list)
+        # and the static NET sources list so we can select
+        # TODO, unsure why reverse mapping needs to be given too (not _attr)
+        combined = {**sources, **net_sources}
+        self._reverse_mapping = {value: key for key, value in combined.items()}
+        # separate for lookup if this is a net source
+        self._reverse_mapping_net = {value: key for key, value in net_sources.items()}
         self._attr_extra_state_attributes = {}
         self._hdmi_out_supported = True
         self._audio_info_supported = True
         self._video_info_supported = True
+        self.call_nr = 0  # number of concurrent calls ... yes it is not thread safe
 
     def command(self, command):
         """Run an eiscp command and catch connection errors."""
         try:
             result = self._receiver.command(command)
-        except (ValueError, OSError, AttributeError, AssertionError):
+        except (ValueError, OSError, AttributeError, AssertionError) as my_ex:
             if self._receiver.command_socket:
                 self._receiver.command_socket = None
+                _LOGGER.debug("Sending %s resulted in exception:", command)
+                _LOGGER.debug(str(my_ex))
                 _LOGGER.debug("Resetting connection to %s", self.name)
             else:
                 _LOGGER.info("%s is disconnected. Attempting to reconnect", self.name)
             return False
         _LOGGER.debug("Result for %s: %s", command, result)
         return result
+
+    def raw(self, command):
+        """Run an eiscp raw command and catch connection errors."""
+        try:
+            result = self._receiver.raw(command)
+        except (ValueError, OSError, AttributeError, AssertionError) as my_ex:
+            if self._receiver.command_socket:
+                self._receiver.command_socket = None
+                _LOGGER.debug("Sending %s resulted in exception:", command)
+                _LOGGER.debug(my_ex)
+                _LOGGER.debug("Resetting connection to %s", self.name)
+            else:
+                _LOGGER.info("%s is disconnected. Attempting to reconnect", self.name)
+            return False
+        _LOGGER.debug("Result for %s: %s", command, result)
+        return result
+
+    def send(self, command):
+        """Run a raw eiscp send without any confirmation check but  catch connection errors."""
+        try:
+            self._receiver.send(command)
+        except (ValueError, OSError, AttributeError, AssertionError) as my_ex:
+            if self._receiver.command_socket:
+                self._receiver.command_socket = None
+                _LOGGER.debug("Sending %s resulted in exception:", command)
+                _LOGGER.debug(my_ex)
+                _LOGGER.debug("Resetting connection to %s", self.name)
+            else:
+                _LOGGER.info("%s is disconnected. Attempting to reconnect", self.name)
+            return False
+        _LOGGER.debug("Sent cmd (no resp. check) %s", command)
+
+    def filter_for_message(self, command):
+        """Wait until a message that starts with command is received or timeout."""
+        try:
+            start = time.time()
+            while True:
+                candidate = self._receiver.get(0.05)
+                # It seems ISCP commands are always three characters.
+                if candidate and candidate.startswith(command):
+                    _LOGGER.debug("Awaited result for %s:  %s", command, candidate)
+                    return candidate
+                # The protocol docs claim that a response  should arrive
+                # within *50ms or the communication has failed*. In my tests,
+                # however, the interval needed to be at least 200ms before
+                # I managed to see any response, and only after 300ms
+                # on a regular basis, so use a generous timeout.
+                if time.time() - start > 5.0:
+                    raise ValueError("Timeout waiting for response.")
+
+        except (ValueError, OSError, AttributeError, AssertionError) as my_ex:
+            if self._receiver.command_socket:
+                self._receiver.command_socket = None
+                _LOGGER.debug("Filter for %s resulted in exception:", command)
+                _LOGGER.debug(my_ex)
+                _LOGGER.debug("Resetting connection to %s", self.name)
+            else:
+                _LOGGER.info("%s is disconnected. Attempting to reconnect", self.name)
+            return False
 
     def update(self) -> None:
         """Get the latest state from the device."""
@@ -327,6 +463,21 @@ class OnkyoDevice(MediaPlayerEntity):
             return
 
         sources = _parse_onkyo_payload(current_source_raw)
+
+        # Net as a source selector branches out to many apps,
+        # check which app is running
+        if "net" in sources:
+            net_stat = self.raw("NLTQSTN")
+            # extract source ID (response contains much more)
+            #  if we got one
+            if net_stat:
+                net_src_id = net_stat[3:5]
+                # if ID exists, set the discoverd sources
+                if self._source_net_mapping.get(net_src_id):
+                    self._attr_source = self._source_net_mapping[net_src_id]
+                    sources = (
+                        []
+                    )  # set to empty to avoid lookup of regular sources (next)
 
         for source in sources:
             if source in self._source_mapping:
@@ -391,9 +542,22 @@ class OnkyoDevice(MediaPlayerEntity):
 
     def select_source(self, source: str) -> None:
         """Set the input source."""
-        if self.source_list and source in self.source_list:
-            source = self._reverse_mapping[source]
-        self.command(f"input-selector {source}")
+        # is the target source a network source?
+        if source in self._reverse_mapping_net:
+            net_src_id = self._reverse_mapping_net[source]
+            # select apps input first, to then select which app to take
+            self.command("input-selector net")
+            # just send the command without checking, the next update should fetch it
+            # trailing 0 indicates no username / password for the receiver app
+            self.send(f"NSV{net_src_id}0")
+
+            # wait for the response which is in form of "NLT.*",
+            # to pass in the query version to ensure valid command (although unneeded)
+            self.filter_for_message(f"NLT{net_src_id}")
+        else:
+            if self.source_list and source in self.source_list:
+                source = self._reverse_mapping[source]
+            self.command(f"input-selector {source}")
 
     def play_media(
         self, media_type: MediaType | str, media_id: str, **kwargs: Any
@@ -402,6 +566,19 @@ class OnkyoDevice(MediaPlayerEntity):
         source = self._reverse_mapping[self._attr_source]
         if media_type.lower() == "radio" and source in DEFAULT_PLAYABLE_SOURCES:
             self.command(f"preset {media_id}")
+        # play "0E": "TuneIn Radio" preset
+        if media_type.lower() == self._source_net_mapping["0E"].lower():
+            # force switch to TuneIn Radio since we continue relative from there
+            self.select_source(media_type)
+            # now we should be in the menu for TuneIn Radio, and see the first option
+            self.filter_for_message("NLSU0")
+            # first entry is My Presets (NLSU0 actually)
+            self.send("NLSI00001")
+            # now we should see a list of presets, wait until the first preset is shown
+            self.filter_for_message("NLSU0")
+            # select the preset by id which should be single didigt
+            self.send(f"NLSI0000{media_id}")
+            # no checking?> the selection should change the status and we should get something back
 
     def select_output(self, output):
         """Set hdmi-out."""
@@ -455,14 +632,17 @@ class OnkyoDeviceZone(OnkyoDevice):
         zone,
         receiver,
         sources,
+        net_sources,
         name=None,
         max_volume=SUPPORTED_MAX_VOLUME,
         receiver_max_volume=DEFAULT_RECEIVER_MAX_VOLUME,
-    ):
+    ) -> None:
         """Initialize the Zone with the zone identifier."""
         self._zone = zone
         self._supports_volume = True
-        super().__init__(receiver, sources, name, max_volume, receiver_max_volume)
+        super().__init__(
+            receiver, sources, net_sources, name, max_volume, receiver_max_volume
+        )
 
     def update(self) -> None:
         """Get the latest state from the device."""

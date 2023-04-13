@@ -31,6 +31,7 @@ CONF_SOURCES = "sources"
 CONF_NET_SOURCES = "net_sources"
 CONF_MAX_VOLUME = "max_volume"
 CONF_RECEIVER_MAX_VOLUME = "receiver_max_volume"
+CONF_SOUND_MODES = "sounc_modes"
 
 DEFAULT_NAME = "Onkyo Receiver"
 SUPPORTED_MAX_VOLUME = 100
@@ -43,6 +44,7 @@ SUPPORT_ONKYO_WO_VOLUME = (
     | MediaPlayerEntityFeature.SELECT_SOURCE
     | MediaPlayerEntityFeature.PLAY
     | MediaPlayerEntityFeature.PLAY_MEDIA
+    | MediaPlayerEntityFeature.SELECT_SOUND_MODE
 )
 SUPPORT_ONKYO = (
     SUPPORT_ONKYO_WO_VOLUME
@@ -108,6 +110,13 @@ DEFAULT_NET_SOURCES = {
 }
 
 
+DEFAULT_SOUND_MODES = {
+    "all": "All",
+    "FR": "Front",
+    "SR": "Dinner",  # Surround
+    "H1": "Kitchen",  # Height 1
+}
+
 DEFAULT_PLAYABLE_SOURCES = ("fm", "am", "tuner")
 
 PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
@@ -122,6 +131,9 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
         ): cv.positive_int,
         vol.Optional(CONF_SOURCES, default=DEFAULT_SOURCES): {cv.string: cv.string},
         vol.Optional(CONF_NET_SOURCES, default=DEFAULT_NET_SOURCES): {
+            cv.string: cv.string
+        },
+        vol.Optional(CONF_SOUND_MODES, default=DEFAULT_SOUND_MODES): {
             cv.string: cv.string
         },
     }
@@ -252,6 +264,7 @@ def setup_platform(
                     receiver,
                     config.get(CONF_SOURCES),
                     config.get(CONF_NET_SOURCES),
+                    config.get(CONF_SOUND_MODES),
                     name=config.get(CONF_NAME),
                     max_volume=config.get(CONF_MAX_VOLUME),
                     receiver_max_volume=config.get(CONF_RECEIVER_MAX_VOLUME),
@@ -270,6 +283,7 @@ def setup_platform(
                         receiver,
                         config.get(CONF_SOURCES),
                         config.get(CONF_NET_SOURCES),
+                        config.get(CONF_SOUND_MODES),
                         name=f"{config[CONF_NAME]} Zone 2",
                         max_volume=config.get(CONF_MAX_VOLUME),
                         receiver_max_volume=config.get(CONF_RECEIVER_MAX_VOLUME),
@@ -284,6 +298,7 @@ def setup_platform(
                         receiver,
                         config.get(CONF_SOURCES),
                         config.get(CONF_NET_SOURCES),
+                        config.get(CONF_SOUND_MODES),
                         name=f"{config[CONF_NAME]} Zone 3",
                         max_volume=config.get(CONF_MAX_VOLUME),
                         receiver_max_volume=config.get(CONF_RECEIVER_MAX_VOLUME),
@@ -296,7 +311,10 @@ def setup_platform(
             if receiver.host not in KNOWN_HOSTS:
                 hosts.append(
                     OnkyoDevice(
-                        receiver, config.get(CONF_SOURCES), config.get(CONF_NET_SOURCES)
+                        receiver,
+                        config.get(CONF_SOURCES),
+                        config.get(CONF_NET_SOURCES),
+                        config.get(CONF_SOUND_MODES),
                     )
                 )
                 KNOWN_HOSTS.append(receiver.host)
@@ -313,6 +331,7 @@ class OnkyoDevice(MediaPlayerEntity):
         receiver,
         sources,
         net_sources,
+        sound_modes,
         name=None,
         max_volume=SUPPORTED_MAX_VOLUME,
         receiver_max_volume=DEFAULT_RECEIVER_MAX_VOLUME,
@@ -350,6 +369,10 @@ class OnkyoDevice(MediaPlayerEntity):
         self._audio_info_supported = True
         self._video_info_supported = True
         self.call_nr = 0  # number of concurrent calls ... yes it is not thread safe
+        self._sound_modes = sound_modes
+        self._sound_modes_reverse = {value: key for key, value in sound_modes.items()}
+        self._attr_sound_mode_list = list(sound_modes.values())
+        self._attr_sound_mode = self._sound_modes["all"]
 
     def command(self, command):
         """Run an eiscp command and catch connection errors."""
@@ -502,6 +525,23 @@ class OnkyoDevice(MediaPlayerEntity):
         if hdmi_out_raw[1] == "N/A":
             self._hdmi_out_supported = False
 
+        # Don't change sound mode in TV, list as all
+        if self._attr_source and self._attr_source.lower() == "tv":
+            self._attr_sound_mode = self._sound_modes_reverse["all"]
+        else:
+            # query current mode
+            current_listenmode_raw = self.command("listening-mode query")
+            current_listenmode = _parse_onkyo_payload(current_listenmode_raw)
+            if current_listenmode[0] != "stereo":
+                self._attr_sound_mode = self._sound_modes["all"]
+            else:
+                # need do query current stereo assign value
+                sam_current_raw = self.raw("SAMQSTN")
+                sam_id = sam_current_raw[3:5]
+                _LOGGER.debug("SAM: %s", sam_id)
+                if sam_id in self._sound_modes:
+                    self._attr_sound_mode = self._sound_modes[sam_id]
+
     def turn_off(self) -> None:
         """Turn the media player off."""
         self.command("system-power standby")
@@ -558,6 +598,25 @@ class OnkyoDevice(MediaPlayerEntity):
             if self.source_list and source in self.source_list:
                 source = self._reverse_mapping[source]
             self.command(f"input-selector {source}")
+
+    def select_sound_mode(self, sound_mode: str) -> None:
+        """Select sound mode."""
+        # should expand to only change in music mode
+        if sound_mode in self._sound_modes_reverse:
+            sm_id = self._sound_modes_reverse[sound_mode]
+            if sm_id == "all":
+                # set to all stereo
+                self.command("listening-mode=all-ch-stereo")
+            else:
+                # sound mode stereo
+                # self.command("listening-mode=stereo")
+                # use raw command, above did result in N/A
+                self.raw("LMD00")
+                # "SAMFR" front
+                # "SAMSR" surround
+                # "SAMH1" Height1
+                # set the stereo assign mode
+                self.raw(f"SAM{sm_id}")
 
     def play_media(
         self, media_type: MediaType | str, media_id: str, **kwargs: Any
@@ -633,6 +692,7 @@ class OnkyoDeviceZone(OnkyoDevice):
         receiver,
         sources,
         net_sources,
+        sound_modes,
         name=None,
         max_volume=SUPPORTED_MAX_VOLUME,
         receiver_max_volume=DEFAULT_RECEIVER_MAX_VOLUME,
@@ -641,7 +701,13 @@ class OnkyoDeviceZone(OnkyoDevice):
         self._zone = zone
         self._supports_volume = True
         super().__init__(
-            receiver, sources, net_sources, name, max_volume, receiver_max_volume
+            receiver,
+            sources,
+            net_sources,
+            sound_modes,
+            name,
+            max_volume,
+            receiver_max_volume,
         )
 
     def update(self) -> None:

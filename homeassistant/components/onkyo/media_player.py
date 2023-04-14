@@ -181,21 +181,6 @@ SERVICE_SELECT_HDMI_OUTPUT = "onkyo_select_hdmi_output"
 PARALLEL_UPDATES = 1
 
 
-# maps an unsolicited message of the receiver
-# to an attribute to update
-# this is for simple commands that include status directly
-# after the three letter code  (1)
-# result will be stored as self._attr_(2)
-ATTR_MAP = {
-    "NTI": "media_title",
-    "NAT": "media_artist",
-    "NAL": "media_album_name",
-    "ATI": "media_title",  # airplay is special ... has its own set of codes
-    "AAT": "media_artist",
-    "AAL": "media_album_name",
-}
-
-
 def _parse_onkyo_payload(payload):
     """Parse a payload returned from the eiscp library."""
     if isinstance(payload, bool):
@@ -343,6 +328,20 @@ class OnkyoDevice(MediaPlayerEntity):
 
     _attr_supported_features = SUPPORT_ONKYO
 
+    # maps an unsolicited message of the receiver
+    # to an attribute to update
+    # this is for simple commands that include status directly
+    # after the three letter code  (1)
+    # result will be stored as self._attr_(2)
+    ATTR_MAP = {
+        "NTI": "media_title",
+        "NAT": "media_artist",
+        "NAL": "media_album_name",
+        "ATI": "media_title",  # airplay is special ... has its own set of codes
+        "AAT": "media_artist",
+        "AAL": "media_album_name",
+    }
+
     def __init__(
         self,
         receiver,
@@ -468,12 +467,13 @@ class OnkyoDevice(MediaPlayerEntity):
 
     def parse_message(self, msg) -> None:
         """Parse an incoming message and update self._attr* according to MAP_ATTR."""
+
         # NOTE first do a hard coded version with each individual one, then we find something better
         _LOGGER.debug(msg)
 
         # if simple translation, just store
         try:
-            attr_name = ATTR_MAP[msg[:3]]
+            attr_name = self.ATTR_MAP[msg[:3]]
             setattr(self, f"_attr_{attr_name}", msg[3:])
             return
         # exception will happen on all unhandled message type (normal ... )

@@ -43,6 +43,8 @@ SUPPORT_ONKYO_WO_VOLUME = (
     | MediaPlayerEntityFeature.TURN_OFF
     | MediaPlayerEntityFeature.SELECT_SOURCE
     | MediaPlayerEntityFeature.PLAY
+    | MediaPlayerEntityFeature.STOP
+    | MediaPlayerEntityFeature.PAUSE
     | MediaPlayerEntityFeature.PLAY_MEDIA
     | MediaPlayerEntityFeature.SELECT_SOUND_MODE
 )
@@ -177,6 +179,21 @@ SERVICE_SELECT_HDMI_OUTPUT = "onkyo_select_hdmi_output"
 # Debugging has shown that the parallel_updates semaphore is locked
 # when the call arrives in the integration (but I don't see the )
 PARALLEL_UPDATES = 1
+
+
+# maps an unsolicited message of the receiver
+# to an attribute to update
+# this is for simple commands that include status directly
+# after the three letter code  (1)
+# result will be stored as self._attr_(2)
+ATTR_MAP = {
+    "NTI": "media_title",
+    "NAT": "media_artist",
+    "NAL": "media_album_name",
+    "ATI": "media_title",  # airplay is special ... has its own set of codes
+    "AAT": "media_artist",
+    "AAL": "media_album_name",
+}
 
 
 def _parse_onkyo_payload(payload):
@@ -374,8 +391,31 @@ class OnkyoDevice(MediaPlayerEntity):
         self._attr_sound_mode_list = list(sound_modes.values())
         self._attr_sound_mode = self._sound_modes["all"]
 
+        self.net_play_unknown = True  # set to true we need to poll for current status
+
+    def process_pending_messages(self) -> None:
+        """Receiver sends autonomous updates, try to use them instead of discarding."""
+        try:
+            # process incoming messages, command would otherwise drop them
+            while True:
+                # only get messages that are already received, don't block
+                rx_msg = self._receiver.get(False)
+                if not rx_msg:
+                    break
+                self.parse_message(rx_msg)
+        except (ValueError, OSError, AttributeError, AssertionError) as my_ex:
+            if self._receiver.command_socket:
+                self._receiver.command_socket = None
+                _LOGGER.debug("Proess pending resulted in exception:")
+                _LOGGER.debug(str(my_ex))
+                _LOGGER.debug("Resetting connection to %s", self.name)
+            else:
+                _LOGGER.info("%s is disconnected. Attempting to reconnect", self.name)
+
     def command(self, command):
         """Run an eiscp command and catch connection errors."""
+        # process incoming messages, command would otherwise drop them
+        self.process_pending_messages()
         try:
             result = self._receiver.command(command)
         except (ValueError, OSError, AttributeError, AssertionError) as my_ex:
@@ -392,7 +432,10 @@ class OnkyoDevice(MediaPlayerEntity):
 
     def raw(self, command):
         """Run an eiscp raw command and catch connection errors."""
+        # process incoming messages, command would otherwise drop them
+        self.process_pending_messages()
         try:
+            # send the actual command
             result = self._receiver.raw(command)
         except (ValueError, OSError, AttributeError, AssertionError) as my_ex:
             if self._receiver.command_socket:
@@ -408,6 +451,8 @@ class OnkyoDevice(MediaPlayerEntity):
 
     def send(self, command):
         """Run a raw eiscp send without any confirmation check but  catch connection errors."""
+        # no need to process pending messages, this is just a send, does not drain RX socket
+        # typically called with a filter_for_message (which then will get the pending  messages)
         try:
             self._receiver.send(command)
         except (ValueError, OSError, AttributeError, AssertionError) as my_ex:
@@ -421,13 +466,67 @@ class OnkyoDevice(MediaPlayerEntity):
             return False
         _LOGGER.debug("Sent cmd (no resp. check) %s", command)
 
+    def parse_message(self, msg) -> None:
+        """Parse an incoming message and update self._attr* according to MAP_ATTR."""
+        # NOTE first do a hard coded version with each individual one, then we find something better
+        _LOGGER.debug(msg)
+
+        # if simple translation, just store
+        try:
+            attr_name = ATTR_MAP[msg[:3]]
+            setattr(self, f"_attr_{attr_name}", msg[3:])
+            return
+        # exception will happen on all unhandled message type (normal ... )
+        except KeyError:
+            pass
+
+        if msg[:5] == "NJA2-":
+            # self._attr_media_image_url = msg[5:]
+            return
+        # both net and airplay have same coding but different base code
+        if msg[:3] == "NST" or msg[:3] == "AST":
+            state_flag = msg[3:4]
+            if state_flag == "S":  # STOP
+                self._attr_state = MediaPlayerState.IDLE
+                self._attr_media_content_type = MediaType.CHANNEL
+                # turn off media info
+                self._attr_media_album_artist = None
+                self._attr_media_album_name = None
+                self._attr_media_artist = None
+                self._attr_media_title = None
+                self._attr_media_image_url = None
+                return
+            if state_flag == "P":  # Play
+                self._attr_state = MediaPlayerState.PLAYING
+                self._attr_media_content_type = MediaType.MUSIC
+
+                return
+            if state_flag == "p":  # Pause
+                self._attr_state = MediaPlayerState.PAUSED
+                self._attr_media_content_type = MediaType.MUSIC
+                return
+
+        # we do not evaluate timing information, However, if the receiver
+        # sends timing, it means it is playing.
+        # This helps as it does not necessarily send out a NSTP-- message sometimes
+        # not reliable, there is a nother time stamp message just after stopping.
+        # would need an ignore counter ... too much
+        # can't get it via # NPB12211000 either ...
+        # if msg[:3] == "NTM":
+        #    if self._attr_state != MediaPlayerState.PLAYING:
+        #        self._attr_state = MediaPlayerState.PLAYING
+        #        self._attr_media_content_type = MediaType.MUSIC
+        #    return
+
     def filter_for_message(self, command):
         """Wait until a message that starts with command is received or timeout."""
         try:
             start = time.time()
             while True:
                 candidate = self._receiver.get(0.05)
-                # It seems ISCP commands are always three characters.
+                # process the message independent of what the higher level logic wants
+                self.parse_message(candidate)
+                # does the message start with what we are lookig for?.
                 if candidate and candidate.startswith(command):
                     _LOGGER.debug("Awaited result for %s:  %s", command, candidate)
                     return candidate
@@ -451,12 +550,20 @@ class OnkyoDevice(MediaPlayerEntity):
 
     def update(self) -> None:
         """Get the latest state from the device."""
+
+        # explicitly process any autonomous updates
+        self.process_pending_messages()
+
         status = self.command("system-power query")
 
         if not status:
             return
         if status[1] == "on":
-            self._attr_state = MediaPlayerState.ON
+            # don't overwrite what we got from parsing the fly by messages
+            # they differentiate more finely for the player state
+            # so only do transition to on
+            if self._attr_state == MediaPlayerState.OFF:
+                self._attr_state = MediaPlayerState.ON
         else:
             self._attr_state = MediaPlayerState.OFF
             self._attr_extra_state_attributes.pop(ATTR_AUDIO_INFORMATION, None)
@@ -527,7 +634,7 @@ class OnkyoDevice(MediaPlayerEntity):
 
         # Don't change sound mode in TV, list as all
         if self._attr_source and self._attr_source.lower() == "tv":
-            self._attr_sound_mode = self._sound_modes_reverse["all"]
+            self._attr_sound_mode = self._sound_modes["all"]
         else:
             # query current mode
             current_listenmode_raw = self.command("listening-mode query")
@@ -541,6 +648,16 @@ class OnkyoDevice(MediaPlayerEntity):
                 _LOGGER.debug("SAM: %s", sam_id)
                 if sam_id in self._sound_modes:
                     self._attr_sound_mode = self._sound_modes[sam_id]
+
+        # do this only after the initial source assignment
+        # do we need to poll for the net player state?
+        if self.net_play_unknown:
+            # safety check that we ar in the network mode
+            if self._attr_source in self._reverse_mapping_net:
+                # poll if we are playing now
+                self.send("NSTQSTN")
+                self.filter_for_message("NST")
+            self.net_play_unknown = False
 
     def turn_off(self) -> None:
         """Turn the media player off."""
@@ -618,10 +735,33 @@ class OnkyoDevice(MediaPlayerEntity):
                 # set the stereo assign mode
                 self.raw(f"SAM{sm_id}")
 
+    def media_play(self) -> None:
+        """User pressed the play button."""
+        # does only work in network mode (nothing else to control otherwise)
+        if self._attr_source in self._reverse_mapping_net:
+            # only do a "oneway" send don't wait for result for now
+            # (it will be updated on the next poll)
+            self.send("NTCPLAY")
+            self.net_play_unknown = True
+
+    def media_pause(self) -> None:
+        """User pressed the pause button."""
+        # does only work in network mode (nothing else to control otherwise)
+        if self._attr_source in self._reverse_mapping_net:
+            self.send("NTCPAUSE")
+            self.net_play_unknown = True
+
+    def media_stop(self) -> None:
+        """User pressed the stop button."""
+        # does only work in network mode (nothing else to control otherwise)
+        if self._attr_source in self._reverse_mapping_net:
+            self.send("NTCSTOP")
+            self.net_play_unknown = True
+
     def play_media(
         self, media_type: MediaType | str, media_id: str, **kwargs: Any
     ) -> None:
-        """Play radio station by preset number."""
+        """Play radio station by preset number triggered from the play_media service call."""
         source = self._reverse_mapping[self._attr_source]
         if media_type.lower() == "radio" and source in DEFAULT_PLAYABLE_SOURCES:
             self.command(f"preset {media_id}")

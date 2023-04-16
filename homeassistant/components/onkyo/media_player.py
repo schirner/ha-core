@@ -468,6 +468,12 @@ class OnkyoDevice(MediaPlayerEntity):
     def parse_message(self, msg) -> None:
         """Parse an incoming message and update self._attr* according to MAP_ATTR."""
 
+        # for some reason if called from play_media,
+        # resulting in error TypeError: 'NoneType' object is not subscriptable
+        # indicating we are getting a msg of None, protect against None ...
+        if not msg:
+            return
+
         # NOTE first do a hard coded version with each individual one, then we find something better
         _LOGGER.debug(msg)
 

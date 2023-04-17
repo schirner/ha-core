@@ -401,22 +401,26 @@ class OnkyoDevice(MediaPlayerEntity):
 
     def process_pending_messages(self) -> None:
         """Receiver sends autonomous updates, try to use them instead of discarding."""
-        try:
-            # process incoming messages, command would otherwise drop them
-            while True:
+
+        # process incoming messages, command would otherwise drop them
+        while True:
+            try:
                 # only get messages that are already received, don't block
+                rx_msg = None
                 rx_msg = self._receiver.get(False)
                 if not rx_msg:
                     break
-                self.parse_message(rx_msg)
-        except (ValueError, OSError, AttributeError, AssertionError) as my_ex:
-            if self._receiver.command_socket:
-                self._receiver.command_socket = None
-                _LOGGER.debug("Proess pending resulted in exception:")
-                _LOGGER.debug(str(my_ex))
-                _LOGGER.debug("Resetting connection to %s", self.name)
-            else:
-                _LOGGER.info("%s is disconnected. Attempting to reconnect", self.name)
+            except (ValueError, OSError, AttributeError, AssertionError) as my_ex:
+                if self._receiver.command_socket:
+                    self._receiver.command_socket = None
+                    _LOGGER.debug("Proess pending resulted in exception:")
+                    _LOGGER.debug(str(my_ex))
+                    _LOGGER.debug("Resetting connection to %s", self.name)
+                else:
+                    _LOGGER.info(
+                        "%s is disconnected. Attempting to reconnect", self.name
+                    )
+            self.parse_message(rx_msg)
 
     def command(self, command):
         """Run an eiscp command and catch connection errors."""
@@ -714,15 +718,21 @@ class OnkyoDevice(MediaPlayerEntity):
             self.net_play_unknown = False
 
         # did we get a new album art according to title/artist/album ... info
-        hash_id = self.calc_media_hash()
+        # hash_id = self.calc_media_hash()
         # _attr_media_image_hash is set when album art is received
         # if both are out of sync, try to update once
-        if hash_id != self._attr_media_image_hash:
-            # request a new album art
-            self.raw("NJAQSTN")
-            # the above should set the new ID, but if it does not,
-            # leave it at a single attempt
-            self._attr_media_image_hash = hash_id
+        # if hash_id != self._attr_media_image_hash:
+        # request a new album art (but don't wait for it, it'll come eventually)
+        # I have seen socket resets when sending this
+        # eiscp/core.py", line 49: assert data[eof_offset] == EOF
+        # which indicates it does not work on parsing the results
+        #    self.send("NJAQSTN")
+        # the above should set the new ID, but if it does not,
+        # leave it at a single attempt
+        #    self._attr_media_image_hash = hash_id
+        # problem: receiver answers with NJALINK with too many new lines, causing an exception
+        # so: A) lib has a problem, and B) we don't get the info anyway. Need to trace what the
+        # android app does instead
 
     def turn_off(self) -> None:
         """Turn the media player off."""

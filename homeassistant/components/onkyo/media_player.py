@@ -438,6 +438,8 @@ class OnkyoDevice(MediaPlayerEntity):
                 _LOGGER.info("%s is disconnected. Attempting to reconnect", self.name)
             return False
         _LOGGER.debug("Result for %s: %s", command, result)
+        # parse result (note what was dropped while waiting for result is still missing)
+        self.parse_message(result)
         return result
 
     def raw(self, command):
@@ -457,6 +459,8 @@ class OnkyoDevice(MediaPlayerEntity):
                 _LOGGER.info("%s is disconnected. Attempting to reconnect", self.name)
             return False
         _LOGGER.debug("Result for %s: %s", command, result)
+        # parse result (note what was dropped while waiting for result is still missing)
+        self.parse_message(result)
         return result
 
     def send(self, command):
@@ -718,21 +722,17 @@ class OnkyoDevice(MediaPlayerEntity):
             self.net_play_unknown = False
 
         # did we get a new album art according to title/artist/album ... info
-        # hash_id = self.calc_media_hash()
+        hash_id = self.calc_media_hash()
         # _attr_media_image_hash is set when album art is received
         # if both are out of sync, try to update once
-        # if hash_id != self._attr_media_image_hash:
-        # request a new album art (but don't wait for it, it'll come eventually)
-        # I have seen socket resets when sending this
-        # eiscp/core.py", line 49: assert data[eof_offset] == EOF
-        # which indicates it does not work on parsing the results
-        #    self.send("NJAQSTN")
-        # the above should set the new ID, but if it does not,
-        # leave it at a single attempt
-        #    self._attr_media_image_hash = hash_id
-        # problem: receiver answers with NJALINK with too many new lines, causing an exception
-        # so: A) lib has a problem, and B) we don't get the info anyway. Need to trace what the
-        # android app does instead
+        if hash_id != self._attr_media_image_hash:
+            # request a new album art, note this is
+            # not NJAQSTN, which queries how album art is transferred
+            # but NJAREQ, which queries the album art itself.
+            self.raw("NJAREQ")
+            # the above should set the new ID, but if it does not,
+            # leave it at a single attempt
+            self._attr_media_image_hash = hash_id
 
     def turn_off(self) -> None:
         """Turn the media player off."""

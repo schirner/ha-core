@@ -173,6 +173,28 @@ ONKYO_SELECT_OUTPUT_SCHEMA = vol.Schema(
 
 SERVICE_SELECT_HDMI_OUTPUT = "onkyo_select_hdmi_output"
 
+# Send custom command to receiver and expect response
+# example yaml
+# service: media_player.send_cmd
+# data:
+#  cmd_resp:
+#    "NJAREQ" :  "NJA"
+# target:
+#  entity_id: media_player.receiverdev
+
+ATTR_CMD_RESP = "cmd_resp"
+ONKYO_SEND_CMD_SCHEMA = vol.Schema(
+    {
+        vol.Required(ATTR_ENTITY_ID): cv.entity_ids,
+        # a list of CMD and RESP
+        # send CMD and wait until result appears
+        # if RESP is 'None' do not await result
+        vol.Required(ATTR_CMD_RESP): {cv.string: cv.string},
+    }
+)
+
+SERVICE_SEND_CMD = "send_cmd"
+
 # only allow 1 parallel call for this integration as the
 # underlying library is not thread safe
 # otherwise we get concurrent calls.
@@ -253,12 +275,21 @@ def setup_platform(
         for device in devices:
             if service.service == SERVICE_SELECT_HDMI_OUTPUT:
                 device.select_output(service.data[ATTR_HDMI_OUTPUT])
+            if service.service == SERVICE_SEND_CMD:
+                device.service_send_cmd(service.data[ATTR_CMD_RESP])
 
     hass.services.register(
         DOMAIN,
         SERVICE_SELECT_HDMI_OUTPUT,
         service_handle,
         schema=ONKYO_SELECT_OUTPUT_SCHEMA,
+    )
+
+    hass.services.register(
+        DOMAIN,
+        SERVICE_SEND_CMD,
+        service_handle,
+        schema=ONKYO_SEND_CMD_SCHEMA,
     )
 
     if CONF_HOST in config and (host := config[CONF_HOST]) not in KNOWN_HOSTS:
@@ -857,6 +888,15 @@ class OnkyoDevice(MediaPlayerEntity):
     def select_output(self, output):
         """Set hdmi-out."""
         self.command(f"hdmi-output-selector={output}")
+
+    # service to send custom commands to receiver and await response
+    def service_send_cmd(self, cmd_resp_list) -> None:
+        """Service call to send custom command and expect result."""
+        for cmd, resp in cmd_resp_list.items():
+            _LOGGER.info("Exec user cmd '%s' waiting for response '%s'", cmd, resp)
+            self.send(cmd)
+            if resp and resp != "None":
+                self.filter_for_message(resp)
 
     def _parse_audio_information(self, audio_information_raw):
         values = _parse_onkyo_payload(audio_information_raw)

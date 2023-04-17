@@ -397,6 +397,7 @@ class OnkyoDevice(MediaPlayerEntity):
         # internal url that should be served from async_get_browse_image
         # assumes only one item at a time
         self.media_image_url_internal = None
+        self._attr_media_image_hash = None
 
     def process_pending_messages(self) -> None:
         """Receiver sends autonomous updates, try to use them instead of discarding."""
@@ -471,6 +472,25 @@ class OnkyoDevice(MediaPlayerEntity):
             return False
         # _LOGGER.debug("Sent cmd (no resp. check) %s", command)
 
+    def calc_media_hash(self) -> str:
+        """To identify what is playing, calculate hash."""
+        # need someo hash to identify music / image
+        # use combined text properties
+        text_id = ""
+        if self._attr_media_album_artist:
+            text_id += self._attr_media_album_artist
+        if self._attr_media_album_artist:
+            text_id += self._attr_media_album_artist
+        if self._attr_media_album_name:
+            text_id += self._attr_media_album_name
+        if self._attr_media_artist:
+            text_id += self._attr_media_artist
+        if self._attr_media_title:
+            text_id += self._attr_media_title
+        if not text_id:
+            return ""
+        return hashlib.sha256(text_id.encode("utf-8")).hexdigest()[:16]
+
     def parse_message(self, msg) -> None:
         """Parse an incoming message and update self._attr* according to MAP_ATTR."""
 
@@ -492,40 +512,31 @@ class OnkyoDevice(MediaPlayerEntity):
         except KeyError:
             pass
 
-        if msg[:5] == "NJA2-":
-            self._attr_media_image_url = msg[5:]
+        if msg[:3] == "NJA":
+            hash_id = self.calc_media_hash()
+            self._attr_media_image_hash = hash_id
+            if msg[3:5] == "2-":
+                self._attr_media_content_id = hash_id
 
-            # need someo hash to identify music / image
-            # use combined text properties
-            text_id = ""
-            if self._attr_media_album_artist:
-                text_id += self._attr_media_album_artist
-            if self._attr_media_album_artist:
-                text_id += self._attr_media_album_artist
-            if self._attr_media_album_name:
-                text_id += self._attr_media_album_name
-            if self._attr_media_artist:
-                text_id += self._attr_media_artist
-            if self._attr_media_title:
-                text_id += self._attr_media_title
-            self._attr_media_image_hash = hashlib.sha256(
-                text_id.encode("utf-8")
-            ).hexdigest()[:16]
-            self._attr_media_content_id = hashlib.sha256(
-                text_id.encode("utf-8")
-            ).hexdigest()[:16]
+                # only if we got some identify attributes (and hash can be computed)
+                # otherwise new message should come once we do have dome title/artist/album info
+                if not hash_id:
+                    return
+                # encode content type and media id in URL so that it
+                # comes back to the async_get_browse_image call to fix errors
+                # for direct, instead use msg[5:] + "?" + self._attr_media_image_hash
+                self._attr_media_image_url = self.get_browse_image_url(
+                    str(self._attr_media_content_type), self._attr_media_content_id
+                )
+                # buffer the actual URL locally to use in async_get_browse_image
+                # + "?" + self._attr_media_image_hash
+                self.media_image_url_internal = msg[5:]
+                return
 
-            # encode content type and media id in URL so that it
-            # comes back to the async_get_browse_image call to fix errors
-            # for direct, instead use msg[5:] + "?" + self._attr_media_image_hash
-            self._attr_media_image_url = self.get_browse_image_url(
-                str(self._attr_media_content_type), self._attr_media_content_id
-            )
-            # buffer the actual URL locally to use in async_get_browse_image
-            # + "?" + self._attr_media_image_hash
-            self.media_image_url_internal = msg[5:]
-
+            # getting image for other than URL is not supported
+            self._attr_media_image_url = None
             return
+
         # both net and airplay have same coding but different base code
         if msg[:3] == "NST" or msg[:3] == "AST":
             state_flag = msg[3:4]
@@ -701,6 +712,17 @@ class OnkyoDevice(MediaPlayerEntity):
                 self.send("NSTQSTN")
                 self.filter_for_message("NST")
             self.net_play_unknown = False
+
+        # did we get a new album art according to title/artist/album ... info
+        hash_id = self.calc_media_hash()
+        # _attr_media_image_hash is set when album art is received
+        # if both are out of sync, try to update once
+        if hash_id != self._attr_media_image_hash:
+            # request a new album art
+            self.raw("NJAQSTN")
+            # the above should set the new ID, but if it does not,
+            # leave it at a single attempt
+            self._attr_media_image_hash = hash_id
 
     def turn_off(self) -> None:
         """Turn the media player off."""

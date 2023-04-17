@@ -1,6 +1,9 @@
 """Support for Onkyo Receivers."""
 from __future__ import annotations
 
+# to parse http headers
+from email.parser import BytesParser
+import hashlib
 import logging
 import time
 from typing import Any
@@ -391,6 +394,9 @@ class OnkyoDevice(MediaPlayerEntity):
         self._attr_sound_mode = self._sound_modes["all"]
 
         self.net_play_unknown = True  # set to true we need to poll for current status
+        # internal url that should be served from async_get_browse_image
+        # assumes only one item at a time
+        self.media_image_url_internal = None
 
     def process_pending_messages(self) -> None:
         """Receiver sends autonomous updates, try to use them instead of discarding."""
@@ -463,7 +469,7 @@ class OnkyoDevice(MediaPlayerEntity):
             else:
                 _LOGGER.info("%s is disconnected. Attempting to reconnect", self.name)
             return False
-        _LOGGER.debug("Sent cmd (no resp. check) %s", command)
+        # _LOGGER.debug("Sent cmd (no resp. check) %s", command)
 
     def parse_message(self, msg) -> None:
         """Parse an incoming message and update self._attr* according to MAP_ATTR."""
@@ -487,7 +493,38 @@ class OnkyoDevice(MediaPlayerEntity):
             pass
 
         if msg[:5] == "NJA2-":
-            # self._attr_media_image_url = msg[5:]
+            self._attr_media_image_url = msg[5:]
+
+            # need someo hash to identify music / image
+            # use combined text properties
+            text_id = ""
+            if self._attr_media_album_artist:
+                text_id += self._attr_media_album_artist
+            if self._attr_media_album_artist:
+                text_id += self._attr_media_album_artist
+            if self._attr_media_album_name:
+                text_id += self._attr_media_album_name
+            if self._attr_media_artist:
+                text_id += self._attr_media_artist
+            if self._attr_media_title:
+                text_id += self._attr_media_title
+            self._attr_media_image_hash = hashlib.sha256(
+                text_id.encode("utf-8")
+            ).hexdigest()[:16]
+            self._attr_media_content_id = hashlib.sha256(
+                text_id.encode("utf-8")
+            ).hexdigest()[:16]
+
+            # encode content type and media id in URL so that it
+            # comes back to the async_get_browse_image call to fix errors
+            # for direct, instead use msg[5:] + "?" + self._attr_media_image_hash
+            self._attr_media_image_url = self.get_browse_image_url(
+                str(self._attr_media_content_type), self._attr_media_content_id
+            )
+            # buffer the actual URL locally to use in async_get_browse_image
+            # + "?" + self._attr_media_image_hash
+            self.media_image_url_internal = msg[5:]
+
             return
         # both net and airplay have same coding but different base code
         if msg[:3] == "NST" or msg[:3] == "AST":
@@ -827,6 +864,39 @@ class OnkyoDevice(MediaPlayerEntity):
             self._attr_extra_state_attributes[ATTR_VIDEO_INFORMATION] = info
         else:
             self._attr_extra_state_attributes.pop(ATTR_VIDEO_INFORMATION, None)
+
+    # serve local album art (and fix)
+    async def async_get_browse_image(
+        self,
+        media_content_type: MediaType | str,
+        media_content_id: str,
+        media_image_id: str | None = None,
+    ) -> tuple[bytes | None, str | None]:
+        """Serve (and fix) Onkyo album art.  Returns (content, content_type)."""
+
+        content, content_type = (None, None)
+
+        if media_content_type == MediaType.MUSIC and media_content_id:
+            # use buffered URL
+            url = self.media_image_url_internal
+            if not url:
+                return content, content_type
+
+            # use original call to get the image
+            content, content_type = await self._async_fetch_image(url)
+
+            # Onkyo contains the content_type as part of the body, lets try to extract it
+            if content and not content_type:
+                # check if the content type is part of the body
+                content_header, content_data = content.split(b"\n\n", 1)
+                if content_header and content_data:
+                    headers_parsed = BytesParser().parsebytes(content_header)
+                    content_type = headers_parsed["Content-type"]
+                    content = content_data
+                else:
+                    _LOGGER.error("NO Content Type for %s", url)
+
+        return content, content_type
 
 
 class OnkyoDeviceZone(OnkyoDevice):
